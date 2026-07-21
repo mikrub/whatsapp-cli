@@ -15,6 +15,8 @@ import (
 	"github.com/vicentereig/whatsapp-cli/internal/types"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waTypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -53,6 +55,31 @@ type MessageDetails struct {
 	Media     *MediaInfo
 }
 
+
+// EnableFullHistorySync asks the phone to push its full message archive at pair
+// time instead of whatsmeow's default recent window.
+//
+// whatsmeow ships RequireFullSync=false with no FullSyncDaysLimit, which is why a
+// freshly linked device only receives recent activity while the official desktop
+// client shows years. These fields travel in the companion-registration payload,
+// so this MUST be called before pairing — it has no effect on an already-linked
+// device. Changing it means re-pairing (scan a new QR).
+//
+// This is a request, not a guarantee: the server and phone decide what they
+// actually send, and a full sync is slower and much larger than the default.
+func EnableFullHistorySync(days uint32) {
+	store.DeviceProps.RequireFullSync = proto.Bool(true)
+	// The phone is more forthcoming with history for a desktop-class companion
+	// than for the default UNKNOWN platform.
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+
+	if store.DeviceProps.HistorySyncConfig == nil {
+		store.DeviceProps.HistorySyncConfig = &waCompanionReg.DeviceProps_HistorySyncConfig{}
+	}
+	store.DeviceProps.HistorySyncConfig.FullSyncDaysLimit = proto.Uint32(days)
+	store.DeviceProps.HistorySyncConfig.FullSyncSizeMbLimit = proto.Uint32(10240)
+	store.DeviceProps.HistorySyncConfig.StorageQuotaMb = proto.Uint32(10240)
+}
 
 func NewWAClient(storeDir string) (*WAClient, error) {
 	// Create store directory

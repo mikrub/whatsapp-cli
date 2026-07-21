@@ -11,8 +11,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vicentereig/whatsapp-cli/internal/client"
 	"github.com/vicentereig/whatsapp-cli/internal/commands"
 )
+
+// parseFullHistoryFlags scans `auth` args for --full-history [--days N].
+// Hand-rolled rather than a FlagSet because the auth command has no FlagSet and
+// adding one would change how existing invocations parse.
+func parseFullHistoryFlags(args []string) (bool, uint32) {
+	const defaultDays = 3650 // ~10y; the server clamps to whatever it actually has
+	full := false
+	days := uint32(defaultDays)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--full-history", "-full-history":
+			full = true
+		case "--days", "-days":
+			if i+1 < len(args) {
+				var parsed uint32
+				if _, err := fmt.Sscanf(args[i+1], "%d", &parsed); err == nil && parsed > 0 {
+					days = parsed
+				}
+				i++
+			}
+		}
+	}
+	return full, days
+}
 
 var (
 	// version is overridden at build time via -ldflags "-X main.version=X.Y.Z"
@@ -147,6 +172,17 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, `{"success":false,"data":null,"error":"invalid store path: %v"}`+"\n", err)
 		os.Exit(1)
+	}
+
+	// Must happen before the client is built, because the full-sync request rides
+	// in the companion-registration payload sent while pairing. Only meaningful
+	// for `auth`; on an already-linked device it is silently inert.
+	if command == "auth" {
+		fullHistory, days := parseFullHistoryFlags(args)
+		if fullHistory {
+			client.EnableFullHistorySync(days)
+			fmt.Fprintf(os.Stderr, "ℹ️  Requesting FULL history sync (%d days) — this pairing will be slower and larger.\n", days)
+		}
 	}
 	app, err := commands.NewApp(absStoreDir, version)
 	if err != nil {
