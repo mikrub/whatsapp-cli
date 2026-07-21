@@ -10,15 +10,15 @@ import (
 
 // MockMessageStore implements MessageStore for testing.
 type MockMessageStore struct {
-	ListMessagesFunc        func(params store.ListMessagesParams) ([]store.Message, error)
-	SearchContactsFunc      func(query string) ([]store.Contact, error)
-	ListChatsFunc           func(params store.ListChatsParams) ([]store.Chat, error)
-	StoreChatFunc           func(jid, name string, lastMessageTime time.Time) error
-	StoreMessageFunc        func(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool, mediaType, filename, url, directPath, mimeType string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error
+	ListMessagesFunc          func(params store.ListMessagesParams) ([]store.Message, error)
+	SearchContactsFunc        func(query string) ([]store.Contact, error)
+	ListChatsFunc             func(params store.ListChatsParams) ([]store.Chat, error)
+	StoreChatFunc             func(jid, name string, lastMessageTime time.Time) error
+	StoreMessageFunc          func(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool, mediaType, filename, url, directPath, mimeType string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error
 	GetMessageForDownloadFunc func(id string, chatJID *string) (store.MessageDownloadInfo, error)
-	MarkMediaDownloadedFunc func(id, chatJID, localPath string, downloadedAt time.Time) error
-	GetOldestMessageFunc    func(chatJID string) (store.OldestMessageInfo, error)
-	CloseFunc               func() error
+	MarkMediaDownloadedFunc   func(id, chatJID, localPath string, downloadedAt time.Time) error
+	GetOldestMessageFunc      func(chatJID string) (store.OldestMessageInfo, error)
+	CloseFunc                 func() error
 }
 
 func (m *MockMessageStore) ListMessages(params store.ListMessagesParams) ([]store.Message, error) {
