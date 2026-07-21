@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vicentereig/whatsapp-cli/internal/client"
 	"github.com/vicentereig/whatsapp-cli/internal/output"
 	"github.com/vicentereig/whatsapp-cli/internal/store"
 	"github.com/vicentereig/whatsapp-cli/internal/types"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
@@ -593,9 +595,196 @@ func (w *mediaDownloadWorker) Stop() {
 	w.wg.Wait()
 }
 
+// historyChatResult summarises what a HistorySync chunk carried for one chat.
+type historyChatResult struct {
+	chatJID string
+	// altJIDs holds the other identifiers the payload used for this same chat
+	// (phone JID / LID). Callers matching a response against a requested chat
+	// need them because the phone may answer under either form.
+	altJIDs  []string
+	messages int
+	// endOfHistory is true only when the payload explicitly stated the primary
+	// device has nothing older left for this chat.
+	endOfHistory bool
+}
+
+// ingestHistorySync stores every conversation carried by a HistorySync payload
+// and enqueues media downloads for messages that have downloadable media.
+//
+// Both the initial sync (INITIAL_BOOTSTRAP/RECENT chunks, see Sync) and the
+// on-demand backfill (ON_DEMAND chunks, see HistoryExtend) go through here, so
+// the two flows persist identical fields and new message types only have to be
+// handled in one place.
+//
+// Results are returned per conversation, in payload order.
+func (a *App) ingestHistorySync(ctx context.Context, v *events.HistorySync, worker *mediaDownloadWorker) []historyChatResult {
+	results := make([]historyChatResult, 0, len(v.Data.Conversations))
+
+	for _, conv := range v.Data.Conversations {
+		chatJID := conv.GetID()
+		chatName := conv.GetName()
+		if chatName == "" {
+			chatName = a.client.ResolveChatName(ctx, chatJID, nil)
+			if chatName == "" {
+				chatName = chatJID
+			}
+		}
+
+		result := historyChatResult{
+			chatJID:      chatJID,
+			altJIDs:      conversationAltJIDs(conv),
+			endOfHistory: conversationEndOfHistory(conv),
+		}
+
+		// Process messages in this conversation
+		for _, msg := range conv.Messages {
+			if msg.Message == nil {
+				continue
+			}
+
+			histMsg := msg.Message
+			msgID := histMsg.Key.GetID()
+			sender := histMsg.Key.GetParticipant()
+			if sender == "" {
+				sender = histMsg.Key.GetRemoteJID()
+			}
+			isFromMe := histMsg.Key.GetFromMe()
+			msgTimestamp := time.Unix(int64(histMsg.GetMessageTimestamp()), 0)
+
+			// Extract content
+			content := ""
+			mediaType := ""
+			filename := ""
+			url := ""
+			directPath := ""
+			mimeType := ""
+			var mediaKey, fileSHA256, fileEncSHA256 []byte
+			var fileLength uint64
+
+			switch {
+			case histMsg.Message.GetConversation() != "":
+				content = histMsg.Message.GetConversation()
+			case histMsg.Message.GetExtendedTextMessage() != nil:
+				extText := histMsg.Message.GetExtendedTextMessage()
+				content = extText.GetText()
+			case histMsg.Message.GetImageMessage() != nil:
+				img := histMsg.Message.GetImageMessage()
+				mediaType = "image"
+				content = img.GetCaption()
+				// Don't use caption as filename - it can be very long text
+				url = img.GetURL()
+				directPath = img.GetDirectPath()
+				mimeType = img.GetMimetype()
+				mediaKey = img.GetMediaKey()
+				fileSHA256 = img.GetFileSHA256()
+				fileEncSHA256 = img.GetFileEncSHA256()
+				fileLength = img.GetFileLength()
+			case histMsg.Message.GetVideoMessage() != nil:
+				video := histMsg.Message.GetVideoMessage()
+				mediaType = "video"
+				content = video.GetCaption()
+				// Don't use caption as filename - it can be very long text
+				url = video.GetURL()
+				directPath = video.GetDirectPath()
+				mimeType = video.GetMimetype()
+				mediaKey = video.GetMediaKey()
+				fileSHA256 = video.GetFileSHA256()
+				fileEncSHA256 = video.GetFileEncSHA256()
+				fileLength = video.GetFileLength()
+			case histMsg.Message.GetAudioMessage() != nil:
+				audio := histMsg.Message.GetAudioMessage()
+				mediaType = "audio"
+				content = "[Audio]"
+				url = audio.GetURL()
+				directPath = audio.GetDirectPath()
+				mimeType = audio.GetMimetype()
+				mediaKey = audio.GetMediaKey()
+				fileSHA256 = audio.GetFileSHA256()
+				fileEncSHA256 = audio.GetFileEncSHA256()
+				fileLength = audio.GetFileLength()
+			case histMsg.Message.GetDocumentMessage() != nil:
+				doc := histMsg.Message.GetDocumentMessage()
+				mediaType = "document"
+				content = doc.GetCaption()
+				filename = doc.GetFileName()
+				url = doc.GetURL()
+				directPath = doc.GetDirectPath()
+				mimeType = doc.GetMimetype()
+				mediaKey = doc.GetMediaKey()
+				fileSHA256 = doc.GetFileSHA256()
+				fileEncSHA256 = doc.GetFileEncSHA256()
+				fileLength = doc.GetFileLength()
+			}
+
+			// Store chat
+			a.store.StoreChat(chatJID, chatName, msgTimestamp)
+
+			// Store message
+			a.store.StoreMessage(
+				msgID,
+				chatJID,
+				sender,
+				content,
+				msgTimestamp,
+				isFromMe,
+				mediaType,
+				filename,
+				url,
+				directPath,
+				mimeType,
+				mediaKey, fileSHA256, fileEncSHA256, fileLength,
+			)
+
+			if directPath != "" && len(mediaKey) > 0 {
+				worker.Enqueue(mediaJob{messageID: msgID, chatJID: chatJID})
+			}
+
+			result.messages++
+		}
+
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// conversationAltJIDs returns the alternate identifiers a payload used for a
+// conversation, so an ON_DEMAND response can be matched against a chat that was
+// requested under its other form.
+func conversationAltJIDs(conv *waHistorySync.Conversation) []string {
+	var alts []string
+	for _, jid := range []string{conv.GetPnJID(), conv.GetLidJID(), conv.GetNewJID(), conv.GetOldJID()} {
+		if jid != "" && jid != conv.GetID() {
+			alts = append(alts, jid)
+		}
+	}
+	return alts
+}
+
+// conversationEndOfHistory reports whether the payload explicitly states that no
+// older messages remain on the primary device for this conversation.
+//
+// The field is optional: an absent value must not be read as the zero enum
+// (COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY) because "phone said nothing" is
+// not the same as "phone said more remain". Only the two values that positively
+// mean "nothing more is coming" count.
+func conversationEndOfHistory(conv *waHistorySync.Conversation) bool {
+	if conv.EndOfHistoryTransferType == nil {
+		return false
+	}
+	switch conv.GetEndOfHistoryTransferType() {
+	case waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY,
+		waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS:
+		return true
+	default:
+		return false
+	}
+}
+
 // Sync connects to WhatsApp and continuously syncs messages to the database
 func (a *App) Sync(ctx context.Context) string {
-	messageCount := 0
+	// Written by the event handler goroutine, read here when the sync ends.
+	var messageCount atomic.Int64
 
 	version := a.version
 	if strings.TrimSpace(version) == "" {
@@ -674,128 +863,15 @@ func (a *App) Sync(ctx context.Context) string {
 				worker.Enqueue(mediaJob{messageID: id, chatJID: chatJID})
 			}
 
-			messageCount++
-			fmt.Fprintf(os.Stderr, "\r💬 Synced %d messages...", messageCount)
+			fmt.Fprintf(os.Stderr, "\r💬 Synced %d messages...", messageCount.Add(1))
 
 		case *events.HistorySync:
 			fmt.Fprintf(os.Stderr, "\n📜 Processing history sync (%d conversations)...\n", len(v.Data.Conversations))
-			for _, conv := range v.Data.Conversations {
-				chatJID := conv.GetID()
-				chatName := conv.GetName()
-				if chatName == "" {
-					chatName = a.client.ResolveChatName(ctx, chatJID, nil)
-					if chatName == "" {
-						chatName = chatJID
-					}
-				}
-
-				// Process messages in this conversation
-				for _, msg := range conv.Messages {
-					if msg.Message == nil {
-						continue
-					}
-
-					histMsg := msg.Message
-					msgID := histMsg.Key.GetID()
-					sender := histMsg.Key.GetParticipant()
-					if sender == "" {
-						sender = histMsg.Key.GetRemoteJID()
-					}
-					isFromMe := histMsg.Key.GetFromMe()
-					msgTimestamp := time.Unix(int64(histMsg.GetMessageTimestamp()), 0)
-
-					// Extract content
-					content := ""
-					mediaType := ""
-					filename := ""
-					url := ""
-					directPath := ""
-					mimeType := ""
-					var mediaKey, fileSHA256, fileEncSHA256 []byte
-					var fileLength uint64
-
-					switch {
-					case histMsg.Message.GetConversation() != "":
-						content = histMsg.Message.GetConversation()
-					case histMsg.Message.GetExtendedTextMessage() != nil:
-						extText := histMsg.Message.GetExtendedTextMessage()
-						content = extText.GetText()
-					case histMsg.Message.GetImageMessage() != nil:
-						img := histMsg.Message.GetImageMessage()
-						mediaType = "image"
-						content = img.GetCaption()
-						// Don't use caption as filename - it can be very long text
-						url = img.GetURL()
-						directPath = img.GetDirectPath()
-						mimeType = img.GetMimetype()
-						mediaKey = img.GetMediaKey()
-						fileSHA256 = img.GetFileSHA256()
-						fileEncSHA256 = img.GetFileEncSHA256()
-						fileLength = img.GetFileLength()
-					case histMsg.Message.GetVideoMessage() != nil:
-						video := histMsg.Message.GetVideoMessage()
-						mediaType = "video"
-						content = video.GetCaption()
-						// Don't use caption as filename - it can be very long text
-						url = video.GetURL()
-						directPath = video.GetDirectPath()
-						mimeType = video.GetMimetype()
-						mediaKey = video.GetMediaKey()
-						fileSHA256 = video.GetFileSHA256()
-						fileEncSHA256 = video.GetFileEncSHA256()
-						fileLength = video.GetFileLength()
-					case histMsg.Message.GetAudioMessage() != nil:
-						audio := histMsg.Message.GetAudioMessage()
-						mediaType = "audio"
-						content = "[Audio]"
-						url = audio.GetURL()
-						directPath = audio.GetDirectPath()
-						mimeType = audio.GetMimetype()
-						mediaKey = audio.GetMediaKey()
-						fileSHA256 = audio.GetFileSHA256()
-						fileEncSHA256 = audio.GetFileEncSHA256()
-						fileLength = audio.GetFileLength()
-					case histMsg.Message.GetDocumentMessage() != nil:
-						doc := histMsg.Message.GetDocumentMessage()
-						mediaType = "document"
-						content = doc.GetCaption()
-						filename = doc.GetFileName()
-						url = doc.GetURL()
-						directPath = doc.GetDirectPath()
-						mimeType = doc.GetMimetype()
-						mediaKey = doc.GetMediaKey()
-						fileSHA256 = doc.GetFileSHA256()
-						fileEncSHA256 = doc.GetFileEncSHA256()
-						fileLength = doc.GetFileLength()
-					}
-
-					// Store chat
-					a.store.StoreChat(chatJID, chatName, msgTimestamp)
-
-					// Store message
-					a.store.StoreMessage(
-						msgID,
-						chatJID,
-						sender,
-						content,
-						msgTimestamp,
-						isFromMe,
-						mediaType,
-						filename,
-						url,
-						directPath,
-						mimeType,
-						mediaKey, fileSHA256, fileEncSHA256, fileLength,
-					)
-
-					if directPath != "" && len(mediaKey) > 0 {
-						worker.Enqueue(mediaJob{messageID: msgID, chatJID: chatJID})
-					}
-
-					messageCount++
-				}
+			stored := 0
+			for _, res := range a.ingestHistorySync(ctx, v, worker) {
+				stored += res.messages
 			}
-			fmt.Fprintf(os.Stderr, "\r💬 Synced %d messages...", messageCount)
+			fmt.Fprintf(os.Stderr, "\r💬 Synced %d messages...", messageCount.Add(int64(stored)))
 
 		case *events.Connected:
 			fmt.Fprintln(os.Stderr, "\n✓ Connected to WhatsApp")
@@ -815,206 +891,12 @@ func (a *App) Sync(ctx context.Context) string {
 	// Wait for context cancellation (Ctrl+C)
 	<-ctx.Done()
 
-	fmt.Fprintf(os.Stderr, "\n\n✓ Sync completed. Total messages synced: %d\n", messageCount)
+	total := messageCount.Load()
+	fmt.Fprintf(os.Stderr, "\n\n✓ Sync completed. Total messages synced: %d\n", total)
 
 	return output.Success(map[string]interface{}{
 		"synced":         true,
-		"messages_count": messageCount,
-	})
-}
-
-// HistoryExtend triggers on-demand backfill of older messages from the user's
-// primary device. Wraps whatsmeow.Client.BuildHistorySyncRequest + a peer
-// SendMessage. Responses arrive as *events.HistorySync chunks (SyncType
-// ON_DEMAND) and flow through the same handler as the initial sync — i.e.
-// they land in messages.db without further wiring.
-//
-// Targeting:
-//   - chatJID set, all=false: extend just that chat
-//   - all=true: iterate every chat in the local store
-//
-// Per-chat loop walks the cursor backward: between requests we re-query for
-// the oldest stored message, which (assuming chunks landed) is now older than
-// the previous request's anchor. With `requests > 1` you get a sliding window.
-//
-// With untilStable=true the per-chat loop stops as soon as the cursor doesn't
-// advance between consecutive requests — that's the strongest local signal
-// that the phone has no older history for that chat. maxRounds caps the
-// per-chat iteration count for safety.
-//
-// The function blocks until ctx is cancelled (timeout from main.go or SIGINT
-// — same lifecycle as Sync) so chunks have time to arrive and be persisted.
-func (a *App) HistoryExtend(ctx context.Context, chatJID string, count, requests int, all, untilStable bool, maxRounds int) string {
-	if count <= 0 {
-		count = 50
-	}
-	if requests <= 0 {
-		requests = 1
-	}
-	if maxRounds <= 0 {
-		maxRounds = 20
-	}
-
-	// Decide target set BEFORE connecting so a typo fails fast.
-	var targets []string
-	if all {
-		chats, err := a.store.ListChats(store.ListChatsParams{Limit: 1000})
-		if err != nil {
-			return output.Error(fmt.Errorf("listing chats: %w", err))
-		}
-		for _, c := range chats {
-			targets = append(targets, c.JID)
-		}
-		if len(targets) == 0 {
-			return output.Error(fmt.Errorf("no chats in local store; run `sync` first"))
-		}
-	} else {
-		if strings.TrimSpace(chatJID) == "" {
-			return output.Error(fmt.Errorf("history extend requires --chat JID or --all"))
-		}
-		targets = []string{chatJID}
-	}
-
-	messageCount := 0
-
-	worker := newMediaDownloadWorker(a, 4)
-	worker.Start(ctx)
-	a.mediaWorker = worker
-	defer func() {
-		worker.Stop()
-		worker.PrintSummary()
-		if a.mediaWorker == worker {
-			a.mediaWorker = nil
-		}
-	}()
-
-	// Reuse the very same handler shape as Sync so ON_DEMAND chunks land in
-	// the existing storage path. (Local copy is intentional — keeps the diff
-	// surgical for upstreaming. A future refactor could extract this into a
-	// shared App method without changing behaviour.)
-	eventHandler := func(evt interface{}) {
-		switch v := evt.(type) {
-		case *events.Message:
-			details := client.HandleMessage(v)
-			a.store.StoreChat(details.ChatJID, a.client.ResolveChatName(ctx, details.ChatJID, v), details.Timestamp)
-			mt, fn, url, dp, mime := "", "", "", "", ""
-			var mk, sh, esh []byte
-			var fl uint64
-			if details.Media != nil {
-				mt, fn, url, dp, mime = details.Media.Type, details.Media.Filename, details.Media.URL, details.Media.DirectPath, details.Media.MimeType
-				mk, sh, esh, fl = details.Media.MediaKey, details.Media.FileSHA256, details.Media.FileEncSHA256, details.Media.FileLength
-			}
-			a.store.StoreMessage(details.ID, details.ChatJID, details.Sender, details.Content, details.Timestamp, details.IsFromMe, mt, fn, url, dp, mime, mk, sh, esh, fl)
-			messageCount++
-
-		case *events.HistorySync:
-			fmt.Fprintf(os.Stderr, "\n📜 on-demand chunk: %d conversations\n", len(v.Data.Conversations))
-			for _, conv := range v.Data.Conversations {
-				cjid := conv.GetID()
-				cname := conv.GetName()
-				if cname == "" {
-					cname = a.client.ResolveChatName(ctx, cjid, nil)
-					if cname == "" {
-						cname = cjid
-					}
-				}
-				for _, msg := range conv.Messages {
-					if msg.Message == nil {
-						continue
-					}
-					hm := msg.Message
-					mid := hm.Key.GetID()
-					sender := hm.Key.GetParticipant()
-					if sender == "" {
-						sender = hm.Key.GetRemoteJID()
-					}
-					ts := time.Unix(int64(hm.GetMessageTimestamp()), 0)
-					content := ""
-					switch {
-					case hm.Message.GetConversation() != "":
-						content = hm.Message.GetConversation()
-					case hm.Message.GetExtendedTextMessage() != nil:
-						content = hm.Message.GetExtendedTextMessage().GetText()
-					}
-					a.store.StoreChat(cjid, cname, ts)
-					a.store.StoreMessage(mid, cjid, sender, content, ts, hm.Key.GetFromMe(), "", "", "", "", "", nil, nil, nil, 0)
-					messageCount++
-				}
-			}
-			fmt.Fprintf(os.Stderr, "💬 cumulative messages this run: %d\n", messageCount)
-
-		case *events.Connected:
-			fmt.Fprintln(os.Stderr, "✓ Connected to WhatsApp")
-
-		case *events.Disconnected:
-			fmt.Fprintln(os.Stderr, "⚠ Disconnected from WhatsApp")
-		}
-	}
-
-	fmt.Fprintln(os.Stderr, "🚀 Starting on-demand history extend...")
-	if err := a.client.StartSync(ctx, eventHandler); err != nil {
-		return output.Error(err)
-	}
-
-	requestsSent := 0
-	skipped := 0
-	stableCount := 0
-	maxIter := requests
-	if untilStable {
-		maxIter = maxRounds
-	}
-	for _, jid := range targets {
-		var prevAnchor string
-		for r := 0; r < maxIter; r++ {
-			oldest, err := a.store.GetOldestMessage(jid)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					if r == 0 {
-						skipped++
-					}
-				} else {
-					fmt.Fprintf(os.Stderr, "  %s: cursor error: %v\n", jid, err)
-				}
-				break
-			}
-			// untilStable: if the cursor didn't advance after the previous request,
-			// the phone has no older history for this chat — stop early.
-			if untilStable && r > 0 && oldest.ID == prevAnchor {
-				fmt.Fprintf(os.Stderr, "  %s: stable after %d request(s)\n", jid, r)
-				stableCount++
-				break
-			}
-			prevAnchor = oldest.ID
-			if err := a.client.RequestMoreHistory(ctx, jid, oldest.ID, oldest.Timestamp, oldest.IsFromMe, oldest.Sender, count); err != nil {
-				fmt.Fprintf(os.Stderr, "  %s: request failed: %v\n", jid, err)
-				break
-			}
-			requestsSent++
-			fmt.Fprintf(os.Stderr, "  → %s (anchor=%s, %d) request %d\n", jid, oldest.ID, count, r+1)
-			// Brief pause so the response chunk lands and updates the oldest cursor
-			// before we ask again. Without this, the next request uses the same
-			// anchor and gets the same window back.
-			select {
-			case <-time.After(3 * time.Second):
-			case <-ctx.Done():
-				return finishHistoryExtend(messageCount, requestsSent, len(targets), skipped, stableCount)
-			}
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "\n📨 Sent %d on-demand requests across %d chat(s) (skipped %d empty, %d stable). Listening for chunks...\n", requestsSent, len(targets), skipped, stableCount)
-	<-ctx.Done()
-	return finishHistoryExtend(messageCount, requestsSent, len(targets), skipped, stableCount)
-}
-
-func finishHistoryExtend(messageCount, requestsSent, chatsTargeted, skipped, stable int) string {
-	return output.Success(map[string]interface{}{
-		"extended":       true,
-		"messages_count": messageCount,
-		"requests_sent":  requestsSent,
-		"chats_targeted": chatsTargeted,
-		"chats_skipped":  skipped,
-		"chats_stable":   stable,
+		"messages_count": total,
 	})
 }
 

@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -74,11 +77,18 @@ Commands:
   send --to RECIPIENT --image PATH [--caption TEXT]      Send an image
   media download --message-id ID [--chat JID] [--output PATH]   Download media for a message
   history extend --chat JID [--count N] [--requests R | --until-stable [--max-rounds N]]
+                 [--response-timeout D] [--listen]
                                     On-demand backfill of older messages for one chat.
   history extend --all   [--count N] [--requests R | --until-stable [--max-rounds N]]
                                     Same, iterating every chat in the local store.
                                     With --until-stable, each chat stops being asked once
-                                    its oldest-message cursor doesn't advance.
+                                    the phone answers and has nothing older left.
+
+                                    Exits with a JSON summary once the requested work is
+                                    done; --listen keeps it running until Ctrl+C instead.
+                                    Chats the phone never answered within
+                                    --response-timeout (default 30s) are reported as
+                                    chats_timed_out, separately from chats_stable.
 
                                     Notes:
                                     - Requires the WhatsApp app open and online on the
@@ -125,9 +135,75 @@ func extractGlobalFlags(args []string) (string, []string) {
 	return storeDir, remaining
 }
 
+// errorJSON renders the CLI's error envelope. The message is encoded rather
+// than interpolated so quotes coming out of flag parsing errors can't break the
+// JSON that wrapping scripts parse.
+func errorJSON(msg string) string {
+	encoded, err := json.Marshal(msg)
+	if err != nil {
+		encoded = []byte(`"invalid error message"`)
+	}
+	return fmt.Sprintf(`{"success":false,"data":null,"error":%s}`, encoded)
+}
+
 func exitJSON(msg string) {
-	fmt.Fprintf(os.Stderr, `{"success":false,"data":null,"error":"%s"}`+"\n", msg)
+	fmt.Fprintln(os.Stderr, errorJSON(msg))
 	os.Exit(1)
+}
+
+// parseHistoryExtendArgs parses the flags of `history extend` (args must already
+// have the command and subcommand stripped) and rejects the combinations the
+// help text advertises as mutually exclusive. Returns an error instead of
+// exiting so it can be tested.
+func parseHistoryExtendArgs(args []string) (commands.HistoryExtendOptions, error) {
+	fs := flag.NewFlagSet("history extend", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	chatJID := fs.String("chat", "", "chat JID to extend (mutually exclusive with --all)")
+	all := fs.Bool("all", false, "extend every chat in the local store")
+	count := fs.Int("count", 50, "messages to request per call (whatsmeow recommends 50)")
+	requests := fs.Int("requests", 1, "consecutive requests per chat — each walks the cursor further back")
+	untilStable := fs.Bool("until-stable", false, "keep requesting per chat until the phone has nothing older (mutually exclusive with --requests)")
+	maxRounds := fs.Int("max-rounds", 20, "with --until-stable: safety cap on per-chat iterations")
+	listen := fs.Bool("listen", false, "after the requested work, keep listening for chunks until interrupted instead of exiting")
+	responseTimeout := fs.Duration("response-timeout", 30*time.Second, "how long to wait for the phone's answer for a chat before giving up on it")
+
+	if err := fs.Parse(args); err != nil {
+		return commands.HistoryExtendOptions{}, err
+	}
+
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	switch {
+	case *chatJID == "" && !*all:
+		return commands.HistoryExtendOptions{}, errors.New("history extend requires exactly one of --chat or --all")
+	case *chatJID != "" && *all:
+		return commands.HistoryExtendOptions{}, errors.New("--chat and --all are mutually exclusive")
+	case set["requests"] && set["until-stable"]:
+		return commands.HistoryExtendOptions{}, errors.New("--requests and --until-stable are mutually exclusive")
+	case set["max-rounds"] && !*untilStable:
+		return commands.HistoryExtendOptions{}, errors.New("--max-rounds only applies with --until-stable")
+	case *count < 1:
+		return commands.HistoryExtendOptions{}, errors.New("--count must be at least 1")
+	case *requests < 1:
+		return commands.HistoryExtendOptions{}, errors.New("--requests must be at least 1")
+	case *maxRounds < 1:
+		return commands.HistoryExtendOptions{}, errors.New("--max-rounds must be at least 1")
+	case *responseTimeout <= 0:
+		return commands.HistoryExtendOptions{}, errors.New("--response-timeout must be positive")
+	}
+
+	return commands.HistoryExtendOptions{
+		ChatJID:         *chatJID,
+		All:             *all,
+		Count:           *count,
+		Requests:        *requests,
+		UntilStable:     *untilStable,
+		MaxRounds:       *maxRounds,
+		Listen:          *listen,
+		ResponseTimeout: *responseTimeout,
+	}, nil
 }
 
 func requireSubcommand(args []string, command string, valid []string) string {
@@ -295,20 +371,11 @@ func main() {
 
 	case "history":
 		requireSubcommand(args, "history", []string{"extend"})
-		histCmd := flag.NewFlagSet("history extend", flag.ExitOnError)
-		chatJID := histCmd.String("chat", "", "chat JID to extend (mutually exclusive with --all)")
-		all := histCmd.Bool("all", false, "extend every chat in the local store")
-		count := histCmd.Int("count", 50, "messages to request per call (whatsmeow recommends 50)")
-		requests := histCmd.Int("requests", 1, "consecutive requests per chat — each walks the cursor further back")
-		untilStable := histCmd.Bool("until-stable", false, "stop requesting per chat when the cursor stops advancing (overrides --requests)")
-		maxRounds := histCmd.Int("max-rounds", 20, "with --until-stable: safety cap on per-chat iterations")
-		if len(args) > 2 {
-			histCmd.Parse(args[2:])
+		opts, err := parseHistoryExtendArgs(args[2:])
+		if err != nil {
+			exitJSON(err.Error())
 		}
-		if (*chatJID == "") == (!*all) {
-			exitJSON("history extend requires exactly one of --chat or --all")
-		}
-		result = app.HistoryExtend(ctx, *chatJID, *count, *requests, *all, *untilStable, *maxRounds)
+		result = app.HistoryExtend(ctx, opts)
 
 	case "media":
 		requireSubcommand(args, "media", []string{"download"})
